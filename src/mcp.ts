@@ -1,26 +1,38 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import {
-  Actor, AppError, PRDetail, PRRow, createPR, getQuotes, listPRs, markWinner, openForQuotes, updatePR,
+  Actor, AppError, CATEGORIES, PRDetail, PRRow, UOMS, createPR, getQuotes, listPRs, listProducts, listVendors, markWinner,
+  openForQuotes, updatePR,
 } from './domain.js';
 
 // The MCP layer is a thin door onto the same domain functions the web screens use.
 // Claude does all the reasoning. These tools only store, read and change records.
 
 const itemSchema = z.object({
-  name: z.string().describe('Item name, e.g. "Laptop 14 inch"'),
+  name: z.string().describe('Item name, e.g. "Laptop 14 inch". Use the catalogue name from list_products when the item is in the catalogue.'),
   quantity: z.number().int().positive().describe('Whole number of units'),
+  uom: z.enum(UOMS).optional().describe('Unit of measure. Required unless the item is in the product catalogue, which then supplies it. Ask if it is unclear, for example cable could be Metre or Roll.'),
+  category: z.enum(CATEGORIES).optional().describe('Product category. Taken from the catalogue when the item is in it.'),
   spec: z.string().optional().describe('Specification or notes for vendors, e.g. "16 GB RAM, 512 GB SSD"'),
-  unit: z.string().optional().describe('Unit of measure, default "nos"'),
 });
+
+type ItemArg = z.infer<typeof itemSchema>;
+const toItems = (items: ItemArg[] | undefined) =>
+  items?.map((i) => ({ name: i.name, quantity: i.quantity, unit: i.uom, category: i.category, spec: i.spec }));
 
 function ok(data: unknown) {
   return { content: [{ type: 'text' as const, text: JSON.stringify(data, null, 2) }] };
 }
 
 function fail(e: unknown) {
-  const msg = e instanceof AppError ? e.message : 'Something went wrong on the server.';
-  if (!(e instanceof AppError)) console.error(e);
+  if (!(e instanceof AppError)) {
+    console.error(e);
+    return { isError: true, content: [{ type: 'text' as const, text: 'Something went wrong on the server.' }] };
+  }
+  // Required details are missing: nothing was saved. Claude should ask the manager, not fill the gap itself.
+  const msg = e.missing
+    ? `Nothing was saved. Required details are missing: ${e.missing.join(', ')}. Ask the manager for these, then call the tool again. Do not guess or fill them in yourself.`
+    : e.message;
   return { isError: true, content: [{ type: 'text' as const, text: msg }] };
 }
 
@@ -44,10 +56,11 @@ function detailForClaude(d: PRDetail, baseUrl: string) {
   const itemName = new Map(d.items.map((i) => [i.id, i.name]));
   return {
     ...prSummary(d.pr, baseUrl),
-    items: d.items.map((i) => ({ name: i.name, quantity: i.quantity, unit: i.unit, spec: i.spec })),
+    items: d.items.map((i) => ({ name: i.name, quantity: i.quantity, uom: i.unit, category: i.category, spec: i.spec })),
     quotes: d.quotes.map((q) => ({
       vendor: q.vendorName,
       city: q.vendorCity,
+      vendor_category: q.vendorCategory,
       total_inr: q.totalInr,
       delivery_days: q.deliveryDays,
       validity_days: q.validityDays,
@@ -59,12 +72,12 @@ function detailForClaude(d: PRDetail, baseUrl: string) {
       within_budget: q.withinBudget,
       is_winner: q.isWinner,
     })),
-    vendors_not_yet_quoted: d.pendingVendors.map((v) => v.name),
+    vendors_not_yet_quoted: d.pendingVendors.map((v) => ({ name: v.name, category: v.category })),
   };
 }
 
 export function buildMcpServer(actor: Actor, baseUrl: string): McpServer {
-  const server = new McpServer({ name: 'quotedesk', version: '0.1.0' });
+  const server = new McpServer({ name: 'quotedesk', version: '0.2.0' });
 
   server.registerTool(
     'list_prs',
@@ -81,7 +94,8 @@ export function buildMcpServer(actor: Actor, baseUrl: string): McpServer {
         return ok(
           rows.map((r) => ({
             pr_number: r.pr_number, title: r.title, status: r.status, items: r.item_count, total_units: r.total_units,
-            quotes_received: r.quote_count, lowest_quote_inr: r.lowest_total, budget_inr: r.budget_inr,
+            delivery_city: r.delivery_city, needed_by: r.needed_by, quote_deadline: r.quote_deadline,
+            quotes_received: r.quote_count, lowest_quote_inr: r.lowest_total, budget_inr: r.budget_inr, winner: r.winner_name,
             app_url: `${baseUrl}/prs/${r.id}`,
           })),
         );
@@ -94,14 +108,14 @@ export function buildMcpServer(actor: Actor, baseUrl: string): McpServer {
     {
       title: 'Create a purchase request',
       description:
-        'Create a purchase request (PR) as a draft from what the manager asked for. Fill in items, quantities and any budget, delivery city or needed-by date they mentioned. Do not invent a budget or dates they did not give. The PR is saved as a draft: the manager can review and edit it in the app before it goes out for quotes.',
+        'Create a purchase request (PR) as a draft from what the manager asked for. Required from the manager: what to buy with a quantity for each item, the delivery city, and the needed-by date. Each item also needs a unit of measure, which comes from the product catalogue when the item is in it. If the manager has not given a required detail, ask for it before calling this tool. Never invent a city, a date, a quantity or a budget. Budget and department are optional. You may write the short title yourself. The PR is saved as a draft: the manager can review and edit it in the app before it goes out for quotes.',
       inputSchema: {
-        title: z.string().describe('Short title, e.g. "Laptops for new joiners"'),
+        title: z.string().describe('Short title you write from the request, e.g. "Laptops for new joiners"'),
         items: z.array(itemSchema).min(1).describe('Line items requested'),
         department: z.string().optional(),
-        delivery_city: z.string().optional(),
-        needed_by: z.string().optional().describe('Date as YYYY-MM-DD'),
-        budget_inr: z.number().nonnegative().optional().describe('Total budget in INR'),
+        delivery_city: z.string().optional().describe('Required. City the goods are delivered to. Ask if not given.'),
+        needed_by: z.string().optional().describe('Required. Date as YYYY-MM-DD. Ask if not given.'),
+        budget_inr: z.number().nonnegative().optional().describe('Total budget in INR. Optional. Leave out if not given.'),
         justification: z.string().optional().describe('Why it is needed, in one or two sentences'),
       },
     },
@@ -110,7 +124,7 @@ export function buildMcpServer(actor: Actor, baseUrl: string): McpServer {
         const pr = await createPR(
           actor,
           {
-            title: a.title, items: a.items, department: a.department, deliveryCity: a.delivery_city,
+            title: a.title, items: toItems(a.items), department: a.department, deliveryCity: a.delivery_city,
             neededBy: a.needed_by, budgetInr: a.budget_inr, justification: a.justification,
           },
           'claude',
@@ -141,7 +155,7 @@ export function buildMcpServer(actor: Actor, baseUrl: string): McpServer {
     async (a) => {
       try {
         const pr = await updatePR(actor, a.pr_number, {
-          title: a.title, items: a.items, department: a.department, deliveryCity: a.delivery_city,
+          title: a.title, items: toItems(a.items), department: a.department, deliveryCity: a.delivery_city,
           neededBy: a.needed_by, budgetInr: a.budget_inr, justification: a.justification, quoteDeadline: a.quote_deadline,
         });
         return ok({ updated: prSummary(pr, baseUrl) });
@@ -154,16 +168,50 @@ export function buildMcpServer(actor: Actor, baseUrl: string): McpServer {
     {
       title: 'Open a purchase request for quotes',
       description:
-        'Move a draft PR to "open". Vendors can then log in to the app and submit quotes, and the manager can also enter a quote on a vendor\'s behalf in the app. Items are locked after this. Only call it after the manager has said to go ahead.',
+        'Move a draft PR to "open". Vendors can then log in to the app and submit quotes, and the manager can also enter a quote on a vendor\'s behalf in the app. Items are locked after this. Only call it after the manager has said to go ahead. A quote deadline is required: it must be today or later, and on or before the needed-by date. If the manager has not given one, ask for it. Do not pick a date yourself.',
       inputSchema: {
         pr_number: z.string().describe('Like PR-0003'),
-        quote_deadline: z.string().optional().describe('Last date for quotes, YYYY-MM-DD'),
+        quote_deadline: z.string().optional().describe('Required unless the PR already has one. Last date for quotes, YYYY-MM-DD. Ask if not given.'),
       },
     },
     async (a) => {
       try {
         const pr = await openForQuotes(actor, a.pr_number, a.quote_deadline);
         return ok({ opened: prSummary(pr, baseUrl), next: 'Vendors can now quote in the app. Ask the manager to say when they want to review quotes.' });
+      } catch (e) { return fail(e); }
+    },
+  );
+
+  server.registerTool(
+    'list_products',
+    {
+      title: 'List the product catalogue',
+      description:
+        'List catalogue products with their category, unit of measure and standard specification. Check it before creating a PR so item names, units and categories match the catalogue. Items outside the catalogue are allowed, but then you must give their unit of measure.',
+      inputSchema: {},
+      annotations: { readOnlyHint: true },
+    },
+    async () => {
+      try {
+        return ok((await listProducts(actor)).map((p) => ({ name: p.name, category: p.category, uom: p.uom, standard_spec: p.spec })));
+      } catch (e) { return fail(e); }
+    },
+  );
+
+  server.registerTool(
+    'list_vendors',
+    {
+      title: 'List vendors',
+      description:
+        'List registered vendors with city, category, contact person, and how many quotes they have submitted and won. Use it to tell the manager which vendors fit a request by category.',
+      inputSchema: {},
+      annotations: { readOnlyHint: true },
+    },
+    async () => {
+      try {
+        return ok((await listVendors()).map((v) => ({
+          name: v.name, city: v.city, category: v.category, contact_person: v.contact_name, quotes_submitted: v.quote_count, requests_won: v.won_count,
+        })));
       } catch (e) { return fail(e); }
     },
   );

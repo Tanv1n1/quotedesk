@@ -2,12 +2,13 @@ import express, { NextFunction, Request, Response } from 'express';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { MCP_TOKEN, PROD, SESSION_SECRET, baseUrlOf } from './config.js';
 import {
-  Actor, AppError, createPR, getActorByEmail, getActorById, getPRDetail, listPRs, listVendors, markWinner, openForQuotes,
-  submitQuote, updatePR, ItemInput,
+  Actor, AppError, createPR, createProduct, createVendor, getActorByEmail, getActorById, getPRDetail, getProduct, getVendor,
+  listPRs, listProducts, listVendors, markWinner, openForQuotes, submitQuote, updatePR, updateProduct, updateVendor, ItemInput,
 } from './domain.js';
 import { DEMO_MANAGER_EMAIL, DEMO_VENDOR_EMAIL } from './seed.js';
 import {
-  aboutPage, connectPage, landingPage, layout, prDetailPage, prFormPage, prListPage, vendorDetailPage, vendorListPage,
+  aboutPage, connectPage, landingPage, layout, prDetailPage, prFormPage, prListPage, productFormPage, productsPage,
+  vendorDetailPage, vendorFormPage, vendorListPage, vendorsPage,
 } from './views.js';
 
 const COOKIE = 'qd_session';
@@ -119,20 +120,22 @@ export function webRoutes(app: express.Express): void {
 
   // ----- manager -----
   app.get('/prs', route('manager', async (req, res, u) => {
-    res.send(layout({ user: u, title: 'Purchase requests', active: 'prs', flash: flashOf(req), body: prListPage(await listPRs(u)) }));
+    const stage = ['draft', 'open', 'awarded'].find((s) => s === req.query.stage);
+    const [rows, vendors] = await Promise.all([listPRs(u), listVendors()]);
+    res.send(layout({ user: u, title: 'Purchase requests', active: 'prs', flash: flashOf(req), body: prListPage(rows, stage, vendors.length) }));
   }));
 
   app.get('/prs/new', route('manager', async (req, res, u) => {
-    res.send(layout({ user: u, title: 'New purchase request', active: 'prs', flash: flashOf(req), body: prFormPage(null, []) }));
+    res.send(layout({ user: u, title: 'New purchase request', active: 'prs', flash: flashOf(req), body: prFormPage(null, [], await listProducts(u)) }));
   }));
 
   const itemsFrom = (b: Record<string, unknown>): ItemInput[] => {
     const arr = (k: string): string[] => (Array.isArray(b[k]) ? (b[k] as string[]) : b[k] === undefined ? [] : [String(b[k])]);
-    const names = arr('item_name'), specs = arr('item_spec'), qtys = arr('item_qty'), units = arr('item_unit');
+    const names = arr('item_name'), specs = arr('item_spec'), qtys = arr('item_qty'), units = arr('item_unit'), cats = arr('item_category');
     const out: ItemInput[] = [];
     names.forEach((name, i) => {
       if (!name.trim() && !(qtys[i] ?? '').trim()) return; // skip fully blank rows
-      out.push({ name, spec: specs[i], unit: units[i], quantity: Number(qtys[i]) });
+      out.push({ name, spec: specs[i], unit: units[i], category: cats[i], quantity: qtys[i] });
     });
     return out;
   };
@@ -141,7 +144,7 @@ export function webRoutes(app: express.Express): void {
     const b = req.body;
     const pr = await createPR(u, {
       title: b.title, department: b.department, deliveryCity: b.delivery_city, neededBy: b.needed_by,
-      budgetInr: b.budget_inr === '' ? null : Number(b.budget_inr), justification: b.justification, items: itemsFrom(b),
+      budgetInr: optNum(b.budget_inr), justification: b.justification, items: itemsFrom(b),
     }, 'app');
     go(res, `/prs/${pr.id}`, { n: `${pr.pr_number} created as a draft.` });
   }, () => '/prs/new'));
@@ -155,7 +158,7 @@ export function webRoutes(app: express.Express): void {
   app.get('/prs/:id/edit', route('manager', async (req, res, u) => {
     const d = await getPRDetail(u, req.params.id);
     if (d.pr.status === 'awarded') throw new AppError(`${d.pr.pr_number} is awarded and can no longer be edited.`, 409);
-    res.send(layout({ user: u, title: `Edit ${d.pr.pr_number}`, active: 'prs', flash: flashOf(req), body: prFormPage(d.pr, d.items) }));
+    res.send(layout({ user: u, title: `Edit ${d.pr.pr_number}`, active: 'prs', flash: flashOf(req), body: prFormPage(d.pr, d.items, await listProducts(u)) }));
   }));
 
   app.post('/prs/:id/edit', form, route('manager', async (req, res, u) => {
@@ -166,7 +169,7 @@ export function webRoutes(app: express.Express): void {
     } else {
       await updatePR(u, d.pr.id, {
         title: b.title, department: b.department, deliveryCity: b.delivery_city, neededBy: b.needed_by,
-        budgetInr: b.budget_inr === '' ? null : Number(b.budget_inr), justification: b.justification, items: itemsFrom(b),
+        budgetInr: optNum(b.budget_inr), justification: b.justification, items: itemsFrom(b),
       });
     }
     go(res, `/prs/${d.pr.id}`, { n: 'Changes saved.' });
@@ -200,6 +203,49 @@ export function webRoutes(app: express.Express): void {
     const w = d.quotes.find((q) => q.isWinner);
     go(res, `/prs/${d.pr.id}`, { n: `${w?.vendorName ?? 'Vendor'} marked as the winner.` });
   }, (req) => `/prs/${req.params.id}`));
+
+  // ----- manager: vendors and products -----
+  app.get('/vendors', route('manager', async (req, res, u) => {
+    res.send(layout({ user: u, title: 'Vendors', active: 'vendors', flash: flashOf(req), body: vendorsPage(await listVendors()) }));
+  }));
+  app.get('/vendors/new', route('manager', async (req, res, u) => {
+    res.send(layout({ user: u, title: 'Add vendor', active: 'vendors', flash: flashOf(req), body: vendorFormPage(null) }));
+  }));
+  app.get('/vendors/:id/edit', route('manager', async (req, res, u) => {
+    const v = await getVendor(u, Number(req.params.id));
+    res.send(layout({ user: u, title: `Edit ${v.name}`, active: 'vendors', flash: flashOf(req), body: vendorFormPage(v) }));
+  }));
+  const vendorFrom = (b: Record<string, string>) => ({
+    name: b.name, city: b.city, category: b.category, contactName: b.contact_name, email: b.email, phone: b.phone,
+  });
+  app.post('/vendors', form, route('manager', async (req, res, u) => {
+    const v = await createVendor(u, vendorFrom(req.body));
+    go(res, '/vendors', { n: `${v.name} added.` });
+  }, () => '/vendors/new'));
+  app.post('/vendors/:id', form, route('manager', async (req, res, u) => {
+    const v = await updateVendor(u, Number(req.params.id), vendorFrom(req.body));
+    go(res, '/vendors', { n: `${v.name} saved.` });
+  }, (req) => `/vendors/${req.params.id}/edit`));
+
+  app.get('/products', route('manager', async (req, res, u) => {
+    res.send(layout({ user: u, title: 'Products', active: 'products', flash: flashOf(req), body: productsPage(await listProducts(u)) }));
+  }));
+  app.get('/products/new', route('manager', async (req, res, u) => {
+    res.send(layout({ user: u, title: 'Add product', active: 'products', flash: flashOf(req), body: productFormPage(null) }));
+  }));
+  app.get('/products/:id/edit', route('manager', async (req, res, u) => {
+    const p = await getProduct(u, Number(req.params.id));
+    res.send(layout({ user: u, title: `Edit ${p.name}`, active: 'products', flash: flashOf(req), body: productFormPage(p) }));
+  }));
+  const productFrom = (b: Record<string, string>) => ({ name: b.name, category: b.category, uom: b.uom, spec: b.spec });
+  app.post('/products', form, route('manager', async (req, res, u) => {
+    const p = await createProduct(u, productFrom(req.body));
+    go(res, '/products', { n: `${p.name} added to the catalogue.` });
+  }, () => '/products/new'));
+  app.post('/products/:id', form, route('manager', async (req, res, u) => {
+    const p = await updateProduct(u, Number(req.params.id), productFrom(req.body));
+    go(res, '/products', { n: `${p.name} saved.` });
+  }, (req) => `/products/${req.params.id}/edit`));
 
   app.get('/connect', route('manager', async (req, res, u) => {
     res.send(layout({ user: u, title: 'Connect to Claude', active: 'connect', body: connectPage(`${baseUrlOf(req)}/mcp/${MCP_TOKEN}`) }));

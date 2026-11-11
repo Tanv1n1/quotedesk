@@ -71,6 +71,19 @@ create table if not exists quote_lines (
   unit_price_inr numeric not null check (unit_price_inr >= 0),
   unique (quote_id, pr_item_id)
 );
+-- v2: vendor master fields, product catalogue, item category. Safe to run on an existing database.
+alter table vendors add column if not exists category text;
+alter table vendors add column if not exists email text;
+alter table vendors add column if not exists phone text;
+alter table pr_items add column if not exists category text;
+create table if not exists products (
+  id serial primary key,
+  name text not null unique,
+  category text not null,
+  uom text not null default 'Nos',
+  spec text,
+  created_at timestamptz not null default now()
+);
 `;
 
 export async function migrate(): Promise<void> {
